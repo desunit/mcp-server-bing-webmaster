@@ -201,7 +201,7 @@ async def get_page_stats(site_url: Annotated[str, "The URL of the site"]) -> Lis
 )
 async def get_rank_and_traffic_stats(
     site_url: Annotated[str, "The URL of the site"],
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
     Get overall ranking and traffic statistics.
 
@@ -868,10 +868,18 @@ async def get_url_traffic_info(
     Returns:
         Traffic information for each URL
     """
-    traffic_info = await api._make_request(
-        "GetUrlTrafficInfo", "POST", {"siteUrl": site_url, "urls": urls}
-    )
-    return api._ensure_type_field(traffic_info, "UrlTrafficInfo")
+    # Bing's GetUrlTrafficInfo is a GET taking a single `url` (POSTing a list 405s).
+    # Fetch each URL individually and aggregate.
+    results: List[Dict[str, Any]] = []
+    for u in urls:
+        info = await api._make_request(
+            "GetUrlTrafficInfo", params={"siteUrl": site_url, "url": u}
+        )
+        if isinstance(info, list):
+            results.extend(info)
+        elif info:
+            results.append(info)
+    return api._ensure_type_field(results, "UrlTrafficInfo")
 
 
 # Crawl Settings Management
@@ -1237,11 +1245,13 @@ async def get_children_url_traffic_info(
     Returns:
         Traffic information for child URLs
     """
+    # GetChildrenUrlTrafficInfo is a GET (mirrors GetChildrenUrlInfo); POST 405s.
     traffic = await api._make_request(
         "GetChildrenUrlTrafficInfo",
-        "POST",
-        {"siteUrl": site_url, "parentUrl": parent_url, "limit": limit},
+        params={"siteUrl": site_url, "parentUrl": parent_url},
     )
+    if isinstance(traffic, list):
+        traffic = traffic[:limit]
     return api._ensure_type_field(traffic, "ChildUrlTrafficInfo")
 
 
