@@ -5,6 +5,8 @@ An MCP server that provides integration with Bing Webmaster Tools,
 enabling site management and analytics through AI assistants.
 """
 
+import base64
+import datetime
 import logging
 import os
 from typing import Annotated, Any, Dict, List, Optional
@@ -348,46 +350,73 @@ async def remove_sitemap(
 
 
 # Keyword Analysis Tools
+#
+# GetKeyword / GetRelatedKeywords are MARKET-WIDE Bing search-volume endpoints, not
+# site-scoped reports. They take `q` + country + language + a date range and take NO
+# siteUrl. Passing {"siteUrl": ..., "query": ...} leaves `q` null server-side and Bing
+# answers 400 "ERROR!!! Object reference not set to an instance of an object." — which
+# reads like a dead endpoint but is really a wrong-parameter error. Both tools failed
+# this way for every call until 2026-08-06.
+def _kw_dates(start_date: Optional[str], end_date: Optional[str]) -> Dict[str, str]:
+    """Default to a trailing 30-day window; Bing wants plain YYYY-MM-DD."""
+    end = end_date or datetime.date.today().isoformat()
+    start = start_date or (datetime.date.fromisoformat(end) - datetime.timedelta(days=30)).isoformat()
+    return {"startDate": start, "endDate": end}
+
+
 @mcp.tool(
     name="get_keyword_data",
-    description="Get detailed data for a specific keyword/query.",
+    description="Get Bing search-volume data for one keyword (market-wide, not site-scoped).",
 )
 async def get_keyword_data(
-    site_url: Annotated[str, "The URL of the site"],
     query: Annotated[str, "The keyword/query to analyze"],
+    country: Annotated[str, "Market country code, e.g. us, gb, de"] = "us",
+    language: Annotated[str, "Language code, e.g. en-US, de-DE"] = "en-US",
+    start_date: Annotated[Optional[str], "YYYY-MM-DD (default: 30 days ago)"] = None,
+    end_date: Annotated[Optional[str], "YYYY-MM-DD (default: today)"] = None,
 ) -> Dict[str, Any]:
     """
-    Get detailed data for a specific keyword/query.
+    Get Bing search-volume data for a single keyword.
 
-    Args:
-        site_url: The URL of the site
-        query: The keyword/query to analyze
+    NOTE: market-wide Bing data, NOT this site's performance for the keyword. For
+    site-scoped numbers use get_query_stats / get_query_page_stats instead.
+
+    A response of {"Query": null, "Impressions": 0} means Bing has no volume for that
+    term in that market — it is a valid empty result, not an error.
 
     Returns:
-        Keyword performance data
+        Keyword volume data (Query, Impressions, BroadImpressions)
     """
-    data = await api._make_request("GetKeyword", params={"siteUrl": site_url, "query": query})
+    params = {"q": query, "country": country, "language": language}
+    params.update(_kw_dates(start_date, end_date))
+    data = await api._make_request("GetKeyword", params=params)
     return api._ensure_type_field(data, "KeywordData")
 
 
-@mcp.tool(name="get_related_keywords", description="Get keywords related to a specific query.")
+@mcp.tool(
+    name="get_related_keywords",
+    description="Get Bing keywords related to a query, with search volume (market-wide).",
+)
 async def get_related_keywords(
-    site_url: Annotated[str, "The URL of the site"],
     query: Annotated[str, "The base keyword/query"],
+    country: Annotated[str, "Market country code, e.g. us, gb, de"] = "us",
+    language: Annotated[str, "Language code, e.g. en-US, de-DE"] = "en-US",
+    start_date: Annotated[Optional[str], "YYYY-MM-DD (default: 30 days ago)"] = None,
+    end_date: Annotated[Optional[str], "YYYY-MM-DD (default: today)"] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Get keywords related to a specific query.
+    Get related keywords with Bing search volume.
 
-    Args:
-        site_url: The URL of the site
-        query: The base keyword/query
+    This is the keyword-research endpoint — market-wide Bing demand, so it works for
+    terms the site does not rank for at all. Each row carries Impressions and
+    BroadImpressions.
 
     Returns:
-        List of related keywords
+        List of related keywords with volume
     """
-    keywords = await api._make_request(
-        "GetRelatedKeywords", params={"siteUrl": site_url, "query": query}
-    )
+    params = {"q": query, "country": country, "language": language}
+    params.update(_kw_dates(start_date, end_date))
+    keywords = await api._make_request("GetRelatedKeywords", params=params)
     return api._ensure_type_field(keywords, "RelatedKeyword")
 
 
@@ -573,25 +602,46 @@ async def get_url_info(
 async def submit_content(
     site_url: Annotated[str, "The URL of the site"],
     url: Annotated[str, "The URL of the content"],
-    content: Annotated[str, "The HTML content to submit"],
+    content: Annotated[str, "The HTML content to submit (raw HTML, not base64)"],
     content_type: Annotated[str, "MIME type of the content"] = "text/html",
-    content_length: Annotated[int, "Length of the content in bytes"] = -1,
+    content_length: Annotated[int, "Deprecated; ignored (derived from content)"] = -1,
+    structured_data: Annotated[str, "Optional base64 structured data blob"] = "",
+    dynamic_serving: Annotated[int, "0=none,1=desktop,2=mobile,3=AMP,4=other"] = 0,
 ) -> Dict[str, str]:
     """
     Submit page content directly to Bing without crawling.
 
+    The API field is `httpMessage`: a base64-encoded COMPLETE HTTP response
+    (status line + headers + blank line + body) — NOT the bare HTML, and NOT a
+    field called `content`. Sending {"content": ...} always fails with a 400 whose
+    body reads:
+
+        "Value cannot be null. Parameter name: httpMessage is null or empty for url: ..."
+
+    That was this tool's behaviour until 2026-08-06 — every call failed. Callers keep
+    passing raw HTML (the useful interface); the HTTP envelope is built here.
+
     Args:
         site_url: The URL of the site
         url: The URL of the content
-        content: The HTML content to submit
-        content_type: MIME type of the content (default: text/html)
-        content_length: Length of the content in bytes (default: auto-calculated)
+        content: The raw HTML to submit
+        content_type: MIME type, used for the Content-Type header (default: text/html)
+        content_length: Deprecated and ignored — the real length is computed from
+            `content`; an inconsistent caller-supplied value corrupts the envelope.
+        structured_data: Optional base64 structured-data blob (default: empty)
+        dynamic_serving: Dynamic-serving hint (default: 0 = none)
 
     Returns:
         Success message
     """
-    if content_length == -1:
-        content_length = len(content.encode("utf-8"))
+    body = content.encode("utf-8")
+    charset = "" if "charset=" in content_type.lower() else "; charset=utf-8"
+    http_message = (
+        f"HTTP/1.1 200 OK\r\n"
+        f"Content-Type: {content_type}{charset}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"\r\n"
+    ).encode("utf-8") + body
 
     await api._make_request(
         "SubmitContent",
@@ -599,9 +649,9 @@ async def submit_content(
         {
             "siteUrl": site_url,
             "url": url,
-            "content": content,
-            "contentType": content_type,
-            "contentLength": content_length,
+            "httpMessage": base64.b64encode(http_message).decode("ascii"),
+            "structuredData": structured_data,
+            "dynamicServing": dynamic_serving,
         },
     )
     return {"message": f"Content for {url} submitted successfully"}
